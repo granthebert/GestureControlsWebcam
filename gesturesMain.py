@@ -1,14 +1,17 @@
-import cv2
-import pyautogui
-import mediapipe as mp
 import os
+import sys
 import time
 import urllib.request
 
-# Webcam
-cap = cv2.VideoCapture(0)
+import cv2
+import mediapipe as mp
+import pyautogui
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
 
-# Gesture tuning
+from testGUI import GestureAction, GestureDashboard
+
+
 FIST_MOVE_STEP_PX = 15
 PINCH_MOVE_STEP_PX = 15
 FIST_MIN_CONFIDENCE_FRAMES = 3
@@ -17,6 +20,16 @@ GESTURE_CONFIRM_FRAMES = 6
 GESTURE_COOLDOWN_SECONDS = 1.0
 COMMAND_SWITCH_DELAY_SECONDS = 0.6
 DISCORD_LEAVE_HOTKEY = ("ctrl", "alt", "shift", "d")
+
+SWIPE_MIN_DISTANCE_PX = 110
+SWIPE_DIRECTION_RATIO = 1.25
+SWIPE_COOLDOWN_SECONDS = 0.55
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
+)
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
 
 def distance(first, second):
@@ -36,7 +49,6 @@ def palm_width(hand_landmarks):
 
 
 def is_fist(hand_landmarks):
-    """Return True when the four main fingers look folded into the palm."""
     finger_pairs = ((8, 6), (12, 10), (16, 14), (20, 18))
     folded_fingers = 0
 
@@ -95,31 +107,52 @@ def hand_center(hand_landmarks, frame_width, frame_height):
     return int(x * frame_width), int(y * frame_height)
 
 
-def adjust_volume_from_fist(current_y, state):
-    movement = current_y - state["anchor_y"]
-    current_step = int(movement / FIST_MOVE_STEP_PX)
-    step_delta = current_step - state["last_step"]
-
-    if step_delta == 0:
-        return
-
-    key = "volumedown" if step_delta > 0 else "volumeup"
-    pyautogui.press(key, presses=abs(step_delta), interval=VOLUME_PRESS_INTERVAL)
-    state["last_step"] = current_step
+def normalized_hand_center(hand_landmarks):
+    palm_landmarks = (0, 5, 9, 13, 17)
+    x = sum(hand_landmarks[i].x for i in palm_landmarks) / len(palm_landmarks)
+    y = sum(hand_landmarks[i].y for i in palm_landmarks) / len(palm_landmarks)
+    return x, y
 
 
-def adjust_player_volume_from_pinch(current_y, state):
-    movement = current_y - state["anchor_y"]
-    current_step = int(movement / PINCH_MOVE_STEP_PX)
-    step_delta = current_step - state["last_step"]
+def is_hand_circle(first_hand, second_hand):
+    first_width = palm_width(first_hand)
+    second_width = palm_width(second_hand)
+    average_width = (first_width + second_width) / 2
+    if average_width <= 0:
+        return False
 
-    if step_delta == 0:
-        return
+    first_center = normalized_hand_center(first_hand)
+    second_center = normalized_hand_center(second_hand)
+    palm_gap = ((first_center[0] - second_center[0]) ** 2 + (first_center[1] - second_center[1]) ** 2) ** 0.5
+    if palm_gap < average_width * 1.15:
+        return False
 
-    # Moving down lowers browser/player volume; moving up raises it.
-    key = "down" if step_delta > 0 else "up"
-    pyautogui.press(key, presses=abs(step_delta), interval=VOLUME_PRESS_INTERVAL)
-    state["last_step"] = current_step
+    thumb_gap = distance(first_hand[4], second_hand[4])
+    if thumb_gap > average_width * 0.52:
+        return False
+
+    fingertip_pairs = ((8, 8), (12, 12), (16, 16), (20, 20))
+    touching_fingers = 0
+    for first_tip, second_tip in fingertip_pairs:
+        if distance(first_hand[first_tip], second_hand[second_tip]) < average_width * 0.58:
+            touching_fingers += 1
+
+    finger_cluster_center_x = (
+        first_hand[8].x + first_hand[12].x + first_hand[16].x + first_hand[20].x
+        + second_hand[8].x + second_hand[12].x + second_hand[16].x + second_hand[20].x
+    ) / 8
+    finger_cluster_center_y = (
+        first_hand[8].y + first_hand[12].y + first_hand[16].y + first_hand[20].y
+        + second_hand[8].y + second_hand[12].y + second_hand[16].y + second_hand[20].y
+    ) / 8
+    thumb_center_x = (first_hand[4].x + second_hand[4].x) / 2
+    thumb_center_y = (first_hand[4].y + second_hand[4].y) / 2
+    cluster_gap = (
+        (finger_cluster_center_x - thumb_center_x) ** 2
+        + (finger_cluster_center_y - thumb_center_y) ** 2
+    ) ** 0.5
+
+    return touching_fingers >= 3 and cluster_gap > average_width * 0.55
 
 
 def recognize_gesture(hand_landmarks):
@@ -136,6 +169,15 @@ def recognize_gesture(hand_landmarks):
     if is_fist(hand_landmarks):
         return "fist"
     return None
+
+
+def make_one_shot_state():
+    return {
+        "last_seen": None,
+        "frames": 0,
+        "triggered": False,
+        "last_action_time": 0,
+    }
 
 
 def handle_confirmed_gesture(gesture_name, action, state, now):
@@ -159,301 +201,498 @@ def handle_confirmed_gesture(gesture_name, action, state, now):
     state["triggered"] = True
 
 
-fist_state = {
-    "active": False,
-    "confidence_frames": 0,
-    "anchor_y": None,
-    "last_step": 0,
-}
-pinch_state = {
-    "active": False,
-    "anchor_y": None,
-    "last_step": 0,
-}
-one_shot_state = {
-    "last_seen": None,
-    "frames": 0,
-    "triggered": False,
-    "last_action_time": 0,
-}
-open_palm_state = {
-    "last_seen": None,
-    "frames": 0,
-    "triggered": False,
-    "last_action_time": 0,
-}
-gestures_paused = False
-gesture_candidate = None
-gesture_candidate_since = 0
+class SwipeTracker:
+    def __init__(self):
+        self.anchor = None
+        self.last_swipe_time = 0
 
-# Choose API depending on installed MediaPipe
-USE_SOLUTIONS = hasattr(mp, "solutions")
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-)
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+    def reset(self):
+        self.anchor = None
 
-if USE_SOLUTIONS:
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7,
-    )
-    mp_draw = mp.solutions.drawing_utils
-    API_MODE = "solutions"
-else:
-    # Use the newer tasks API. Download the .task model if missing.
-    try:
-        from mediapipe.tasks import python as mp_python
-        from mediapipe.tasks.python import vision
-    except Exception as e:
-        raise ImportError(
-            "Installed MediaPipe is missing the tasks API required for this fallback: "
-            f"{e}"
-        )
+    def update(self, center, now):
+        if center is None:
+            self.anchor = None
+            return None
 
-    if not os.path.exists(MODEL_PATH):
+        if self.anchor is None:
+            self.anchor = center
+            return None
+
+        if now - self.last_swipe_time < SWIPE_COOLDOWN_SECONDS:
+            self.anchor = center
+            return None
+
+        dx = center[0] - self.anchor[0]
+        dy = center[1] - self.anchor[1]
+        action = None
+
+        if abs(dx) >= SWIPE_MIN_DISTANCE_PX and abs(dx) > abs(dy) * SWIPE_DIRECTION_RATIO:
+            action = GestureAction.SWIPE_RIGHT if dx > 0 else GestureAction.SWIPE_LEFT
+        elif abs(dy) >= SWIPE_MIN_DISTANCE_PX and abs(dy) > abs(dx) * SWIPE_DIRECTION_RATIO:
+            action = GestureAction.SWIPE_DOWN if dy > 0 else GestureAction.SWIPE_UP
+
+        if action is not None:
+            self.anchor = center
+            self.last_swipe_time = now
+            return action
+
+        if abs(dx) < 30 and abs(dy) < 30:
+            self.anchor = center
+
+        return None
+
+
+class GestureController:
+    def __init__(self, dashboard):
+        self.dashboard = dashboard
+        self.cap = cv2.VideoCapture(0)
+
+        self.fist_state = {
+            "active": False,
+            "confidence_frames": 0,
+            "anchor_y": None,
+            "last_step": 0,
+        }
+        self.pinch_state = {
+            "active": False,
+            "anchor_y": None,
+            "last_step": 0,
+        }
+        self.one_shot_state = make_one_shot_state()
+        self.open_palm_state = make_one_shot_state()
+        self.gesture_candidate = None
+        self.gesture_candidate_since = 0
+        self.desktop_gestures_paused = False
+        self.gui_control_active = True
+        self.swipe_tracker = SwipeTracker()
+
+        self._setup_mediapipe()
+        self.dashboard.set_control_surface_active(self.gui_control_active)
+
+    def _setup_mediapipe(self):
+        self.use_solutions = hasattr(mp, "solutions")
+        if self.use_solutions:
+            self.mp_hands = mp.solutions.hands
+            self.hands = self.mp_hands.Hands(
+                max_num_hands=2,
+                min_detection_confidence=0.7,
+                min_tracking_confidence=0.7,
+            )
+            self.mp_draw = mp.solutions.drawing_utils
+            self.api_mode = "solutions"
+            return
+
         try:
-            print(f"Downloading model to {MODEL_PATH}...")
-            urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to download hand_landmarker.task model.\n"
-                "You can download it manually from:\n"
-                f"{MODEL_URL}\n"
-                f"Error: {e}"
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+        except Exception as exc:
+            raise ImportError(
+                "Installed MediaPipe is missing the tasks API required for this fallback: "
+                f"{exc}"
             )
 
-    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
-    options = vision.HandLandmarkerOptions(
-        base_options=base_options,
-        num_hands=1,
-        min_hand_detection_confidence=0.7,
-        min_tracking_confidence=0.7,
-    )
-    detector = vision.HandLandmarker.create_from_options(options)
-    API_MODE = "tasks"
+        if not os.path.exists(MODEL_PATH):
+            try:
+                print(f"Downloading model to {MODEL_PATH}...")
+                urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to download hand_landmarker.task model.\n"
+                    "You can download it manually from:\n"
+                    f"{MODEL_URL}\n"
+                    f"Error: {exc}"
+                )
 
-while True:
-    success, frame = cap.read()
-    if not success:
-        break
+        base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=2,
+            min_hand_detection_confidence=0.7,
+            min_tracking_confidence=0.7,
+        )
+        self.detector = vision.HandLandmarker.create_from_options(options)
+        self.api_mode = "tasks"
 
-    # Flip image
-    frame = cv2.flip(frame, 1)
+    def process_frame(self):
+        success, frame = self.cap.read()
+        if not success:
+            QApplication.quit()
+            return
 
-    # Convert to RGB
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, _ = frame.shape
 
-    h, w, _ = frame.shape
-    detected_gesture = None
-    center = None
+        detected_gesture, center = self._detect_hand(rgb_frame, frame, width, height)
+        now = time.monotonic()
+        detected_gesture = self._stabilize_command_switch(detected_gesture, now, frame)
 
-    if API_MODE == "solutions":
-        # legacy MediaPipe solutions API
-        result = hands.process(rgb_frame)
-        if result and result.multi_hand_landmarks:
-            for hand_landmarks in result.multi_hand_landmarks:
-                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-                landmarks = hand_landmarks.landmark
-                detected_gesture = recognize_gesture(landmarks)
-                center = hand_center(landmarks, w, h)
-                break
-    else:
-        # mediapipe.tasks API
-        try:
-            mp_image = mp.Image(mp.ImageFormat.SRGB, rgb_frame)
-            detection_result = detector.detect(mp_image)
-        except Exception:
-            detection_result = None
+        if detected_gesture == "hand_circle":
+            handle_confirmed_gesture(
+                detected_gesture,
+                self._toggle_gui_control,
+                self.open_palm_state,
+                now,
+            )
+        else:
+            self._reset_open_palm()
 
-        if detection_result and getattr(detection_result, "hand_landmarks", None):
-            for hand_landmarks in detection_result.hand_landmarks:
-                # hand_landmarks is a list of landmarks with normalized x,y
-                detected_gesture = recognize_gesture(hand_landmarks)
-                center = hand_center(hand_landmarks, w, h)
-                break
+        if self.gui_control_active:
+            self._handle_gui_control(detected_gesture, center, now, frame)
+        else:
+            self._handle_desktop_control(detected_gesture, center, now, frame, width)
 
-    now = time.monotonic()
-    raw_detected_gesture = detected_gesture
+        self._draw_status(frame, detected_gesture, center, height)
+        cv2.imshow("Gesture Control", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            QApplication.quit()
+        elif key == ord("m"):
+            self._toggle_gui_control()
+        elif key == ord("p"):
+            self.desktop_gestures_paused = not self.desktop_gestures_paused
 
-    if raw_detected_gesture != gesture_candidate:
-        gesture_candidate = raw_detected_gesture
-        gesture_candidate_since = now
+    def shutdown(self):
+        self.cap.release()
+        cv2.destroyAllWindows()
+        if getattr(self, "api_mode", None) == "solutions":
+            self.hands.close()
 
-        fist_state["active"] = False
-        fist_state["confidence_frames"] = 0
-        fist_state["anchor_y"] = None
-        fist_state["last_step"] = 0
-        pinch_state["active"] = False
-        pinch_state["anchor_y"] = None
-        pinch_state["last_step"] = 0
-        one_shot_state["last_seen"] = None
-        one_shot_state["frames"] = 0
-        one_shot_state["triggered"] = False
-        open_palm_state["last_seen"] = None
-        open_palm_state["frames"] = 0
-        open_palm_state["triggered"] = False
-
-    if raw_detected_gesture and now - gesture_candidate_since < COMMAND_SWITCH_DELAY_SECONDS:
+    def _detect_hand(self, rgb_frame, draw_frame, width, height):
         detected_gesture = None
-        cv2.putText(
-            frame,
-            "Hold gesture...",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (180, 180, 180),
-            2,
-        )
+        center = None
 
-    if detected_gesture == "open_palm":
-        handle_confirmed_gesture(
-            "open_palm",
-            lambda: globals().__setitem__("gestures_paused", not gestures_paused),
-            open_palm_state,
-            now,
-        )
-    else:
-        open_palm_state["last_seen"] = None
-        open_palm_state["frames"] = 0
-        open_palm_state["triggered"] = False
+        if self.api_mode == "solutions":
+            result = self.hands.process(rgb_frame)
+            if result and result.multi_hand_landmarks:
+                all_landmarks = [
+                    hand_landmarks.landmark
+                    for hand_landmarks in result.multi_hand_landmarks
+                ]
+                for hand_landmarks in result.multi_hand_landmarks:
+                    self.mp_draw.draw_landmarks(
+                        draw_frame,
+                        hand_landmarks,
+                        self.mp_hands.HAND_CONNECTIONS,
+                    )
+                if len(all_landmarks) >= 2 and is_hand_circle(all_landmarks[0], all_landmarks[1]):
+                    detected_gesture = "hand_circle"
+                    first_center = hand_center(all_landmarks[0], width, height)
+                    second_center = hand_center(all_landmarks[1], width, height)
+                    center = (
+                        (first_center[0] + second_center[0]) // 2,
+                        (first_center[1] + second_center[1]) // 2,
+                    )
+                else:
+                    landmarks = all_landmarks[0]
+                    detected_gesture = recognize_gesture(landmarks)
+                    center = hand_center(landmarks, width, height)
+        else:
+            try:
+                mp_image = mp.Image(mp.ImageFormat.SRGB, rgb_frame)
+                detection_result = self.detector.detect(mp_image)
+            except Exception:
+                detection_result = None
 
-    if gestures_paused:
-        fist_state["active"] = False
-        fist_state["confidence_frames"] = 0
-        pinch_state["active"] = False
-        cv2.putText(
-            frame,
-            "Gestures paused",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 255, 255),
-            2,
-        )
-    elif detected_gesture == "fist" and center:
-        fist_state["confidence_frames"] += 1
-        cx, cy = center
-        pinch_state["active"] = False
+            if detection_result and getattr(detection_result, "hand_landmarks", None):
+                all_landmarks = detection_result.hand_landmarks
+                if len(all_landmarks) >= 2 and is_hand_circle(all_landmarks[0], all_landmarks[1]):
+                    detected_gesture = "hand_circle"
+                    first_center = hand_center(all_landmarks[0], width, height)
+                    second_center = hand_center(all_landmarks[1], width, height)
+                    center = (
+                        (first_center[0] + second_center[0]) // 2,
+                        (first_center[1] + second_center[1]) // 2,
+                    )
+                else:
+                    hand_landmarks = all_landmarks[0]
+                    detected_gesture = recognize_gesture(hand_landmarks)
+                    center = hand_center(hand_landmarks, width, height)
 
-        if not fist_state["active"] and fist_state["confidence_frames"] >= FIST_MIN_CONFIDENCE_FRAMES:
-            fist_state["active"] = True
-            fist_state["anchor_y"] = cy
-            fist_state["last_step"] = 0
+        return detected_gesture, center
 
-        if fist_state["active"]:
-            adjust_volume_from_fist(cy, fist_state)
-            cv2.circle(frame, (cx, cy), 14, (0, 255, 0), -1)
-            cv2.line(frame, (0, fist_state["anchor_y"]), (w, fist_state["anchor_y"]), (0, 255, 255), 2)
+    def _stabilize_command_switch(self, detected_gesture, now, frame):
+        raw_detected_gesture = detected_gesture
+        if raw_detected_gesture != self.gesture_candidate:
+            self.gesture_candidate = raw_detected_gesture
+            self.gesture_candidate_since = now
+            self._reset_motion_states()
+            self._reset_one_shot()
+            self._reset_open_palm()
+
+        if self.gui_control_active and raw_detected_gesture == "open_palm":
+            return raw_detected_gesture
+
+        if raw_detected_gesture and now - self.gesture_candidate_since < COMMAND_SWITCH_DELAY_SECONDS:
             cv2.putText(
                 frame,
-                "Fist volume mode",
+                "Hold gesture...",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
-                (0, 255, 0),
+                (180, 180, 180),
                 2,
             )
-    elif detected_gesture == "pinch" and center:
-        fist_state["active"] = False
-        fist_state["confidence_frames"] = 0
-        cx, cy = center
+            return None
 
-        if not pinch_state["active"]:
-            pinch_state["active"] = True
-            pinch_state["anchor_y"] = cy
-            pinch_state["last_step"] = 0
+        return detected_gesture
 
-        adjust_player_volume_from_pinch(cy, pinch_state)
-        cv2.circle(frame, (cx, cy), 14, (255, 0, 255), -1)
-        cv2.line(frame, (0, pinch_state["anchor_y"]), (w, pinch_state["anchor_y"]), (255, 0, 255), 2)
+    def _handle_gui_control(self, detected_gesture, center, now, frame):
+        self._reset_motion_states()
+        swipe_action = self.swipe_tracker.update(
+            center if detected_gesture == "open_palm" else None,
+            now,
+        )
+        if swipe_action is not None:
+            self.dashboard.dispatch_gesture(swipe_action)
+
+        if detected_gesture == "pointing":
+            handle_confirmed_gesture(
+                "gui_select",
+                lambda: self.dashboard.dispatch_gesture(GestureAction.SELECT),
+                self.one_shot_state,
+                now,
+            )
+        elif detected_gesture == "peace":
+            handle_confirmed_gesture(
+                "gui_lock",
+                self._toggle_dashboard_lock,
+                self.one_shot_state,
+                now,
+            )
+        elif detected_gesture == "thumbs_down":
+            handle_confirmed_gesture(
+                "gui_back",
+                self._dashboard_back_or_exit,
+                self.one_shot_state,
+                now,
+            )
+        elif detected_gesture not in ("open_palm", "hand_circle"):
+            self._reset_one_shot()
+
         cv2.putText(
             frame,
-            "Pinch arrow volume",
+            "GUI mode: open-palm swipe | peace lock | point select | circle exit",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
+            0.72,
+            (78, 220, 255),
+            2,
+        )
+
+    def _handle_desktop_control(self, detected_gesture, center, now, frame, width):
+        self.swipe_tracker.reset()
+        if self.desktop_gestures_paused:
+            self._reset_motion_states()
+            cv2.putText(
+                frame,
+                "Desktop gestures paused (press p)",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 255),
+                2,
+            )
+            return
+
+        if detected_gesture == "fist" and center:
+            self._handle_fist_volume(center, frame, width)
+        elif detected_gesture == "pinch" and center:
+            self._handle_pinch_volume(center, frame, width)
+        elif detected_gesture == "pointing":
+            self._reset_motion_states()
+            handle_confirmed_gesture(
+                "pointing",
+                lambda: pyautogui.press("playpause"),
+                self.one_shot_state,
+                now,
+            )
+            self._draw_mode_text(frame, "Media pause/play", (255, 255, 0))
+        elif detected_gesture == "thumbs_down":
+            self._reset_motion_states()
+            handle_confirmed_gesture(
+                "thumbs_down",
+                lambda: pyautogui.hotkey("alt", "f4"),
+                self.one_shot_state,
+                now,
+            )
+            self._draw_mode_text(frame, "Alt+F4", (0, 200, 255))
+        elif detected_gesture == "peace":
+            self._reset_motion_states()
+            handle_confirmed_gesture(
+                "peace",
+                lambda: pyautogui.hotkey(*DISCORD_LEAVE_HOTKEY),
+                self.one_shot_state,
+                now,
+            )
+            self._draw_mode_text(frame, "Discord hotkey", (0, 165, 255))
+        else:
+            self._reset_motion_states()
+            if not detected_gesture:
+                self._reset_one_shot()
+
+    def _handle_fist_volume(self, center, frame, width):
+        self.fist_state["confidence_frames"] += 1
+        center_x, center_y = center
+        self.pinch_state["active"] = False
+
+        if (
+            not self.fist_state["active"]
+            and self.fist_state["confidence_frames"] >= FIST_MIN_CONFIDENCE_FRAMES
+        ):
+            self.fist_state["active"] = True
+            self.fist_state["anchor_y"] = center_y
+            self.fist_state["last_step"] = 0
+
+        if self.fist_state["active"]:
+            self._adjust_volume_from_fist(center_y)
+            cv2.circle(frame, (center_x, center_y), 14, (0, 255, 0), -1)
+            cv2.line(
+                frame,
+                (0, self.fist_state["anchor_y"]),
+                (width, self.fist_state["anchor_y"]),
+                (0, 255, 255),
+                2,
+            )
+            self._draw_mode_text(frame, "Fist volume mode", (0, 255, 0))
+
+    def _handle_pinch_volume(self, center, frame, width):
+        self.fist_state["active"] = False
+        self.fist_state["confidence_frames"] = 0
+        center_x, center_y = center
+
+        if not self.pinch_state["active"]:
+            self.pinch_state["active"] = True
+            self.pinch_state["anchor_y"] = center_y
+            self.pinch_state["last_step"] = 0
+
+        self._adjust_player_volume_from_pinch(center_y)
+        cv2.circle(frame, (center_x, center_y), 14, (255, 0, 255), -1)
+        cv2.line(
+            frame,
+            (0, self.pinch_state["anchor_y"]),
+            (width, self.pinch_state["anchor_y"]),
             (255, 0, 255),
             2,
         )
-    elif detected_gesture == "pointing":
-        fist_state["active"] = False
-        fist_state["confidence_frames"] = 0
-        pinch_state["active"] = False
-        handle_confirmed_gesture("pointing", lambda: pyautogui.press("playpause"), one_shot_state, now)
-        cv2.putText(
-            frame,
-            "Media pause/play",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (255, 255, 0),
-                2,
-            )
-    elif detected_gesture == "thumbs_down":
-        fist_state["active"] = False
-        fist_state["confidence_frames"] = 0
-        pinch_state["active"] = False
-        handle_confirmed_gesture("thumbs_down", lambda: pyautogui.hotkey("alt", "f4"), one_shot_state, now)
-        cv2.putText(
-            frame,
-            "Alt+F4",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 200, 255),
-            2,
-        )
-    elif detected_gesture == "peace":
-        fist_state["active"] = False
-        fist_state["confidence_frames"] = 0
-        pinch_state["active"] = False
-        handle_confirmed_gesture(
-            "peace",
-            lambda: pyautogui.hotkey(*DISCORD_LEAVE_HOTKEY),
-            one_shot_state,
-            now,
-        )
-        cv2.putText(
-            frame,
-            "Discord hotkey",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 165, 255),
-            2,
-        )
-    else:
-        fist_state["active"] = False
-        fist_state["confidence_frames"] = 0
-        fist_state["anchor_y"] = None
-        fist_state["last_step"] = 0
-        pinch_state["active"] = False
-        pinch_state["anchor_y"] = None
-        pinch_state["last_step"] = 0
-        if not detected_gesture:
-            one_shot_state["last_seen"] = None
-            one_shot_state["frames"] = 0
-            one_shot_state["triggered"] = False
+        self._draw_mode_text(frame, "Pinch arrow volume", (255, 0, 255))
 
-    if detected_gesture and center:
+    def _adjust_volume_from_fist(self, current_y):
+        movement = current_y - self.fist_state["anchor_y"]
+        current_step = int(movement / FIST_MOVE_STEP_PX)
+        step_delta = current_step - self.fist_state["last_step"]
+
+        if step_delta == 0:
+            return
+
+        key = "volumedown" if step_delta > 0 else "volumeup"
+        pyautogui.press(key, presses=abs(step_delta), interval=VOLUME_PRESS_INTERVAL)
+        self.fist_state["last_step"] = current_step
+
+    def _adjust_player_volume_from_pinch(self, current_y):
+        movement = current_y - self.pinch_state["anchor_y"]
+        current_step = int(movement / PINCH_MOVE_STEP_PX)
+        step_delta = current_step - self.pinch_state["last_step"]
+
+        if step_delta == 0:
+            return
+
+        key = "down" if step_delta > 0 else "up"
+        pyautogui.press(key, presses=abs(step_delta), interval=VOLUME_PRESS_INTERVAL)
+        self.pinch_state["last_step"] = current_step
+
+    def _toggle_gui_control(self):
+        self.gui_control_active = not self.gui_control_active
+        self.dashboard.set_control_surface_active(self.gui_control_active)
+        if self.gui_control_active:
+            self.dashboard.showMaximized()
+            self.dashboard.raise_()
+            self.dashboard.activateWindow()
+        self._reset_motion_states()
+        self._reset_one_shot()
+        self.swipe_tracker.reset()
+
+    def _toggle_dashboard_lock(self):
+        action = (
+            GestureAction.UNLOCK_PAGE
+            if self.dashboard.page_manager.locked
+            else GestureAction.LOCK_PAGE
+        )
+        self.dashboard.dispatch_gesture(action)
+
+    def _dashboard_back_or_exit(self):
+        if self.dashboard.page_manager.locked:
+            self.dashboard.dispatch_gesture(GestureAction.BACK)
+        else:
+            self._toggle_gui_control()
+
+    def _reset_motion_states(self):
+        self.fist_state["active"] = False
+        self.fist_state["confidence_frames"] = 0
+        self.fist_state["anchor_y"] = None
+        self.fist_state["last_step"] = 0
+        self.pinch_state["active"] = False
+        self.pinch_state["anchor_y"] = None
+        self.pinch_state["last_step"] = 0
+
+    def _reset_one_shot(self):
+        self.one_shot_state["last_seen"] = None
+        self.one_shot_state["frames"] = 0
+        self.one_shot_state["triggered"] = False
+
+    def _reset_open_palm(self):
+        self.open_palm_state["last_seen"] = None
+        self.open_palm_state["frames"] = 0
+        self.open_palm_state["triggered"] = False
+
+    def _draw_status(self, frame, detected_gesture, center, height):
+        mode = "GUI MENU" if self.gui_control_active else "DESKTOP"
         cv2.putText(
             frame,
-            f"Gesture: {detected_gesture}",
-            (20, h - 20),
+            f"Mode: {mode}",
+            (20, height - 48),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (255, 255, 255),
+            (78, 220, 255) if self.gui_control_active else (255, 255, 255),
             2,
         )
 
-    cv2.imshow("Gesture Control", frame)
+        if detected_gesture and center:
+            cv2.putText(
+                frame,
+                f"Gesture: {detected_gesture}",
+                (20, height - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
 
-    # Press q to quit
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+    def _draw_mode_text(self, frame, text, color):
+        cv2.putText(
+            frame,
+            text,
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            color,
+            2,
+        )
 
-cap.release()
-cv2.destroyAllWindows()
+
+def main():
+    app = QApplication(sys.argv)
+    dashboard = GestureDashboard()
+    dashboard.showMaximized()
+
+    controller = GestureController(dashboard)
+    timer = QTimer()
+    timer.timeout.connect(controller.process_frame)
+    timer.start(15)
+    app.aboutToQuit.connect(controller.shutdown)
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
