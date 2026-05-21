@@ -15,6 +15,7 @@ FIST_MIN_CONFIDENCE_FRAMES = 3
 VOLUME_PRESS_INTERVAL = 0.02
 GESTURE_CONFIRM_FRAMES = 6
 GESTURE_COOLDOWN_SECONDS = 1.0
+COMMAND_SWITCH_DELAY_SECONDS = 0.6
 DISCORD_LEAVE_HOTKEY = ("ctrl", "alt", "shift", "d")
 
 
@@ -182,6 +183,8 @@ open_palm_state = {
     "last_action_time": 0,
 }
 gestures_paused = False
+gesture_candidate = None
+gesture_candidate_since = 0
 
 # Choose API depending on installed MediaPipe
 USE_SOLUTIONS = hasattr(mp, "solutions")
@@ -273,6 +276,37 @@ while True:
                 break
 
     now = time.monotonic()
+    raw_detected_gesture = detected_gesture
+
+    if raw_detected_gesture != gesture_candidate:
+        gesture_candidate = raw_detected_gesture
+        gesture_candidate_since = now
+
+        fist_state["active"] = False
+        fist_state["confidence_frames"] = 0
+        fist_state["anchor_y"] = None
+        fist_state["last_step"] = 0
+        pinch_state["active"] = False
+        pinch_state["anchor_y"] = None
+        pinch_state["last_step"] = 0
+        one_shot_state["last_seen"] = None
+        one_shot_state["frames"] = 0
+        one_shot_state["triggered"] = False
+        open_palm_state["last_seen"] = None
+        open_palm_state["frames"] = 0
+        open_palm_state["triggered"] = False
+
+    if raw_detected_gesture and now - gesture_candidate_since < COMMAND_SWITCH_DELAY_SECONDS:
+        detected_gesture = None
+        cv2.putText(
+            frame,
+            "Hold gesture...",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (180, 180, 180),
+            2,
+        )
 
     if detected_gesture == "open_palm":
         handle_confirmed_gesture(

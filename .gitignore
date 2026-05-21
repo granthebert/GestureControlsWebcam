@@ -4,3 +4,17 @@ dist/
 *.spec
 *.exe
 *.pkg
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+
+# MediaPipe model
+hand_landmarker.task
+
+# VSCode
+.vscode/
